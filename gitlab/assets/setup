@@ -1,0 +1,94 @@
+#!/bin/bash
+
+set -e
+
+source /etc/lsb-release
+source /RELEASE
+
+# Remove sensitive content from RELEASE file. We can't remove the file because
+# we are using it in assets/wrapper.
+# sed -i "/DOWNLOAD_URL/d;/TRIGGER_PRIVATE_TOKEN/d;" /RELEASE
+
+# Install zlib
+wget --no-check-certificate --tries=5 https://www.zlib.net/zlib-${ZLIB_VERSION}.tar.gz -O /tmp/zlib-${ZLIB_VERSION}.tar.gz \
+&& cd /tmp \
+&& tar xf zlib-${ZLIB_VERSION}.tar.gz \
+&& cd zlib-${ZLIB_VERSION}/ \
+&& ./configure \
+&& make && make install
+
+# Install OpenSSL
+wget --no-check-certificate --tries=5 https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz -O /tmp/openssl-${OPENSSL_VERSION}.tar.gz \
+&& cd /tmp \
+&& tar xf openssl-${OPENSSL_VERSION}.tar.gz \
+&& cd openssl-${OPENSSL_VERSION}/ \
+&& ./config shared zlib \
+&& make && make install \
+&& ln -s /usr/local/ssl/bin/openssl /usr/bin/openssl \
+&& ln -s /usr/local/ssl/include/openssl /usr/include/openssl \
+&& echo "/usr/local/ssl/lib" > /etc/ld.so.conf.d/openssl.conf \
+&& ldconfig \
+&& echo 'sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin' >> /etc/passwd
+
+# Install OpenSSH
+apt-get update -q && apt-get install -yq libpam0g-dev libpam-runtime \
+&& wget --no-check-certificate --tries=5 https://openbsd.hk/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_VERSION}.tar.gz -O /tmp/openssh-${OPENSSH_VERSION}.tar.gz \
+&& cd /tmp \
+&& tar xf openssh-${OPENSSH_VERSION}.tar.gz \
+&& cd openssh-${OPENSSH_VERSION}/ \
+&& ./configure --prefix=/usr --sysconfdir=/etc/ssh --with-md5-passwords --with-pam --with-zlib --with-ssl-dir=/usr/local/ssl --with-privsep-path=/var/lib/sshd \
+&& make && make install \
+&& cp /assets/pam_sshd /etc/pam.d/sshd \
+&& chmod 644 /etc/pam.d/sshd 
+
+# Install GitLab
+# DOWNLOAD_URL=${DOWNLOAD_URL} TRIGGER_PRIVATE_TOKEN=${TRIGGER_PRIVATE_TOKEN} /assets/download-package && dpkg -i /tmp/gitlab.deb && rm /tmp/gitlab.deb
+wget --no-check-certificate --content-disposition --tries=5 https://packages.gitlab.com/gitlab/gitlab-ce/packages/ubuntu/xenial/gitlab-ce_${RELEASE_VERSION}_amd64.deb/download.deb -O /tmp/gitlab.deb && dpkg -i /tmp/gitlab.deb && rm /tmp/gitlab.deb
+rm -rf /var/lib/apt/lists/*
+rm -rf /tmp/zlib-${ZLIB_VERSION}*
+rm -rf /tmp/openssl-${OPENSSL_VERSION}*
+rm -rf /tmp/openssh-${OPENSSH_VERSION}*
+
+unset ZLIB_DOWNLOAD_URL
+unset OPENSSL_DOWNLOAD_URL
+unset OPENSSH_DOWNLOAD_URL
+unset DOWNLOAD_URL
+
+# Create sshd daemon
+mkdir -p /opt/gitlab/sv/sshd/supervise /opt/gitlab/sv/sshd/log/supervise
+mkfifo /opt/gitlab/sv/sshd/supervise/ok /opt/gitlab/sv/sshd/log/supervise/ok
+printf "#!/bin/sh\nexec 2>&1\numask 077\nexec /usr/sbin/sshd -D -f /assets/sshd_config -e" > /opt/gitlab/sv/sshd/run
+printf "#!/bin/sh\nexec svlogd -tt /var/log/gitlab/sshd" > /opt/gitlab/sv/sshd/log/run
+chmod a+x /opt/gitlab/sv/sshd/run /opt/gitlab/sv/sshd/log/run
+
+# Remove current gitlab.rb file
+rm -f /etc/gitlab/gitlab.rb
+
+# Patch omnibus package
+sed -i "s/external_url 'GENERATED_EXTERNAL_URL'/# external_url 'GENERATED_EXTERNAL_URL'/" /opt/gitlab/etc/gitlab.rb.template
+sed -i "s/\/etc\/gitlab\/gitlab.rb/\/assets\/gitlab.rb/" /opt/gitlab/embedded/cookbooks/gitlab/recipes/show_config.rb
+sed -i "s/\/etc\/gitlab\/gitlab.rb/\/assets\/gitlab.rb/" /opt/gitlab/embedded/cookbooks/gitlab/recipes/config.rb
+
+# Set install type to docker
+echo 'gitlab-docker' > /opt/gitlab/embedded/service/gitlab-rails/INSTALLATION_TYPE
+
+# Create groups
+groupadd -g 998 git
+groupadd -g 999 gitlab-www
+groupadd -g 997 gitlab-redis
+groupadd -g 996 gitlab-psql
+
+groupadd -g 994 mattermost
+groupadd -g 993 registry
+groupadd -g 992 gitlab-prometheus
+groupadd -g 991 gitlab-consul
+
+# Create accounts
+useradd -m -u 998 -g git -m -s /bin/sh -d /var/opt/gitlab git
+useradd -m -u 999 -g gitlab-www -m -s /bin/false -d /var/opt/gitlab/nginx gitlab-www
+useradd -m -u 997 -g gitlab-redis -m -s /bin/false -d /var/opt/gitlab/redis gitlab-redis
+useradd -m -u 996 -g gitlab-psql -m -s /bin/sh -d /var/opt/gitlab/postgresql gitlab-psql
+useradd -m -u 994 -g mattermost -m -s /bin/sh -d /var/opt/gitlab/mattermost mattermost
+useradd -m -u 993 -g registry -m -s /bin/sh -d /var/opt/gitlab/registry registry
+useradd -m -u 992 -g gitlab-prometheus -m -s /bin/sh -d /var/opt/gitlab/prometheus gitlab-prometheus
+useradd -m -u 991 -g gitlab-consul -m -s /bin/sh -d /var/opt/gitlab/consul gitlab-consul
